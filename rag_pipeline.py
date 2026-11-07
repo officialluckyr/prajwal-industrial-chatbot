@@ -1,20 +1,21 @@
-
 import numpy as np
 import faiss
 from fastembed import TextEmbedding
 
-EMBEDDING_MODEL = "BAAI/bge-small-en-v1.5"
+# Hugging Face Hub Model Identifier for Semantic Retrieval
+HF_EMBEDDING_MODEL = "BAAI/bge-small-en-v1.5"
 
-# Load the model once and reuse it
+# Load the Hugging Face ONNX embedding model once and reuse it
 _model = None
+
 
 def get_model():
     global _model
 
     if _model is None:
-        print("Loading FastEmbed model...")
-        _model = TextEmbedding(model_name=EMBEDDING_MODEL)
-        print("Embedding model is ready.")
+        print(f"Loading Hugging Face Embedding Model ({HF_EMBEDDING_MODEL})...")
+        _model = TextEmbedding(model_name=HF_EMBEDDING_MODEL)
+        print("Hugging Face Embedding model is ready.")
 
     return _model
 
@@ -49,7 +50,8 @@ def build_vector_index(documents):
         "documents": documents,
         "index_bytes": index_bytes,
         "total_vectors": index.ntotal,
-        "dimension": dimension
+        "dimension": dimension,
+        "hf_embedding_model": HF_EMBEDDING_MODEL
     }
 
 

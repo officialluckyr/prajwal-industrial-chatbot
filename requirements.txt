@@ -6,3 +6,9 @@ fastembed>=0.7.0
 google-genai>=1.0.0
 reportlab>=4.0
 supabase>=2.0.0
+huggingface-hub
+transformers
+faiss-cpu
+pypdf
+google-genai
+python-dotenv

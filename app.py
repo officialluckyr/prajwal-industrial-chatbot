@@ -1,4 +1,3 @@
-
 import os
 import tempfile
 from datetime import datetime
@@ -7,6 +6,7 @@ from xml.sax.saxutils import escape
 import gradio as gr
 from google import genai
 from google.genai import types
+from huggingface_hub import InferenceClient
 
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import A4
@@ -19,8 +19,12 @@ from reportlab.platypus import (
     HRFlowable
 )
 
-from document_processor import process_pdfs
-from rag_pipeline import build_vector_index, search_documents
+from document_processor import process_pdfs, HF_TOKENIZER_NAME
+from rag_pipeline import (
+    build_vector_index,
+    search_documents,
+    HF_EMBEDDING_MODEL
+)
 from supabase_client import (
     add_equipment,
     list_equipment,
@@ -30,12 +34,14 @@ from supabase_client import (
 
 
 GEMINI_MODEL = "gemini-3.5-flash-lite"
+HF_LLM_MODEL = "Qwen/Qwen2.5-72B-Instruct"
 
 _gemini_client = None
+_hf_client = None
 
 
 # -------------------------------
-# GEMINI CLIENT
+# AI CLIENTS (HUGGING FACE & GEMINI)
 # -------------------------------
 
 def get_gemini_client():
@@ -50,6 +56,17 @@ def get_gemini_client():
         _gemini_client = genai.Client(api_key=api_key)
 
     return _gemini_client
+
+
+def get_hf_client():
+    """Initialize Hugging Face InferenceClient when HF_TOKEN is configured."""
+    global _hf_client
+
+    hf_token = os.getenv("HF_TOKEN")
+    if _hf_client is None and hf_token:
+        _hf_client = InferenceClient(api_key=hf_token)
+
+    return _hf_client
 
 
 # -------------------------------
@@ -219,16 +236,19 @@ def load_documents(files):
 
         for item in documents[:5]:
             preview += (
-                f"### {item['source']} — Page {item['page']}\n\n"
+                f"### {item['source']} — Page {item['page']} "
+                f"({item.get('token_count', 0)} HF tokens)\n\n"
                 f"{item['text'][:500]}\n\n---\n\n"
             )
 
         status = (
             "### Knowledge Base Ready\n"
-            f"- PDF files: {len(files)}\n"
-            f"- Text chunks: {len(documents)}\n"
-            f"- Indexed vectors: {knowledge_base['total_vectors']}\n"
-            f"- Embedding dimensions: {knowledge_base['dimension']}"
+            f"- **PDF files:** {len(files)}\n"
+            f"- **Text chunks:** {len(documents)}\n"
+            f"- **HF Tokenizer:** `{HF_TOKENIZER_NAME}`\n"
+            f"- **HF Embedding Model:** `{HF_EMBEDDING_MODEL}`\n"
+            f"- **Indexed vectors (FAISS):** {knowledge_base['total_vectors']}\n"
+            f"- **Embedding dimensions:** {knowledge_base['dimension']}"
         )
 
         return knowledge_base, status, preview
@@ -264,8 +284,6 @@ def format_history(history, max_messages=8):
 
 def generate_answer(question, results, history, equipment=None):
 
-    client = get_gemini_client()
-
     evidence = ""
 
     for i, item in enumerate(results, start=1):
@@ -274,6 +292,7 @@ def generate_answer(question, results, history, equipment=None):
             f"\n[Source {i}]\n"
             f"Document: {item['source']}\n"
             f"Page: {item['page']}\n"
+            f"Similarity Score: {item['score']:.3f}\n"
             f"Content:\n{item['text']}\n"
         )
 
@@ -310,7 +329,7 @@ Use the equipment information to understand which machine
 the user is discussing. Do not treat equipment metadata as
 manufacturer-verified technical specifications.
 
-RELEVANT MANUAL EVIDENCE:
+RELEVANT MANUAL EVIDENCE (Retrieved via Hugging Face {HF_EMBEDDING_MODEL} & FAISS):
 {evidence}
 
 CURRENT USER QUESTION:
@@ -337,27 +356,45 @@ Answer the current question while considering the
 previous conversation.
 """
 
-    response = client.models.generate_content(
-        model=GEMINI_MODEL,
-        contents=prompt,
-        config=types.GenerateContentConfig(
-            max_output_tokens=1500
+    answer_text = None
+
+    # Primary Inference via Gemini (with optional Hugging Face InferenceClient fallback)
+    try:
+        client = get_gemini_client()
+        response = client.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                max_output_tokens=1500
+            )
         )
-    )
+        answer_text = response.text
+    except Exception as gemini_err:
+        hf_client = get_hf_client()
+        if hf_client is not None:
+            hf_resp = hf_client.chat.completions.create(
+                model=HF_LLM_MODEL,
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=1000,
+                temperature=0.2,
+            )
+            answer_text = hf_resp.choices[0].message.content
+        else:
+            raise gemini_err
 
-    if not response.text:
-        raise ValueError("Gemini returned an empty response.")
+    if not answer_text:
+        raise ValueError("Language model returned an empty response.")
 
-    source_list = "\n\n---\n\n**Retrieved manual sources:**\n"
+    source_list = "\n\n---\n\n**Retrieved manual sources (Hugging Face + FAISS):**\n"
 
     for i, item in enumerate(results, start=1):
 
         source_list += (
             f"\n- [Source {i}] {item['source']} — "
-            f"Page {item['page']}"
+            f"Page {item['page']} (Score: {item['score']:.2f})"
         )
 
-    return response.text + source_list
+    return answer_text + source_list
 
 
 # -------------------------------
@@ -629,12 +666,14 @@ Write the report in plain text with clear section headings.
 
 with gr.Blocks(theme=gr.themes.Soft()) as demo:
 
-    gr.Markdown("""
+    gr.Markdown(f"""
     # RoboMaint AI
     ### Industrial Robotics & Machine Maintenance Assistant
 
     Your AI-powered assistant for industrial manuals,
     technical questions and maintenance reporting.
+
+    **Architecture:** Hugging Face Transformers Tokenizer (`{HF_TOKENIZER_NAME}`) • Hugging Face Dense Embeddings (`{HF_EMBEDDING_MODEL}`) • FAISS Vector Index • Hybrid Cloud LLM Engine
     """)
 
 
