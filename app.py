@@ -21,6 +21,12 @@ from reportlab.platypus import (
 
 from document_processor import process_pdfs
 from rag_pipeline import build_vector_index, search_documents
+from supabase_client import (
+    add_equipment,
+    list_equipment,
+    get_equipment,
+    validate_user_id,
+)
 
 
 GEMINI_MODEL = "gemini-3.5-flash-lite"
@@ -44,6 +50,152 @@ def get_gemini_client():
         _gemini_client = genai.Client(api_key=api_key)
 
     return _gemini_client
+
+
+# -------------------------------
+# EQUIPMENT MANAGEMENT
+# -------------------------------
+
+def get_current_user_id():
+    """Get the configured user UUID for this single-user demo."""
+
+    user_id = os.getenv("ROBOMAINT_USER_ID")
+
+    if not user_id:
+        raise ValueError(
+            "ROBOMAINT_USER_ID is missing. Configure it in the environment."
+        )
+
+    return validate_user_id(user_id)
+
+
+def equipment_label(item):
+    """Create a readable dropdown label."""
+
+    parts = [
+        item.get("name"),
+        item.get("equipment_type"),
+        item.get("model_number"),
+    ]
+
+    return " | ".join(str(part) for part in parts if part)
+
+
+def format_equipment_details(item):
+    """Display selected equipment information."""
+
+    if not item:
+        return "No equipment selected."
+
+    fields = [
+        ("Name", "name"),
+        ("Type", "equipment_type"),
+        ("Manufacturer", "manufacturer"),
+        ("Model", "model_number"),
+        ("Serial number", "serial_number"),
+        ("Location", "location"),
+        ("Status", "status"),
+    ]
+
+    output = "### Selected Equipment\n\n"
+
+    for label, key in fields:
+        value = item.get(key) or "Not provided"
+        output += f"- **{label}:** {value}\n"
+
+    return output
+
+
+def refresh_equipment():
+    """Refresh the equipment dropdown from Supabase."""
+
+    try:
+        user_id = get_current_user_id()
+        equipment = list_equipment(user_id)
+
+        choices = [
+            (equipment_label(item), item["id"])
+            for item in equipment
+        ]
+
+        return (
+            gr.update(choices=choices, value=None),
+            f"Found **{len(equipment)}** registered equipment record(s)."
+        )
+
+    except Exception as error:
+        return gr.update(choices=[], value=None), f"Equipment loading failed: {error}"
+
+
+def select_equipment(equipment_id):
+    """Load the selected equipment record."""
+
+    if not equipment_id:
+        return None, "No equipment selected."
+
+    try:
+        user_id = get_current_user_id()
+
+        item = get_equipment(user_id, equipment_id)
+
+        if not item:
+            return None, "Equipment record not found."
+
+        return item, format_equipment_details(item)
+
+    except Exception as error:
+        return None, f"Equipment selection failed: {error}"
+
+
+def register_equipment(
+    name,
+    equipment_type,
+    manufacturer,
+    model_number,
+    serial_number,
+    location,
+    notes,
+):
+    """Save a new equipment record to Supabase."""
+
+    try:
+        user_id = get_current_user_id()
+
+        if not name or not name.strip():
+            raise ValueError("Equipment name is required.")
+
+        item = add_equipment(
+            user_id,
+            name,
+            equipment_type=equipment_type or None,
+            manufacturer=manufacturer or None,
+            model_number=model_number or None,
+            serial_number=serial_number or None,
+            location=location or None,
+            notes=notes or None,
+        )
+
+        equipment = list_equipment(user_id)
+
+        choices = [
+            (equipment_label(record), record["id"])
+            for record in equipment
+        ]
+
+        return (
+            gr.update(choices=choices, value=item["id"]),
+            "Equipment registered successfully.",
+            item,
+            format_equipment_details(item),
+        )
+
+    except Exception as error:
+        return (
+            gr.update(),
+            f"Registration failed: {error}",
+            None,
+            "Equipment registration failed.",
+        )
 
 
 # -------------------------------
@@ -110,7 +262,7 @@ def format_history(history, max_messages=8):
 # AI ANSWER GENERATION
 # -------------------------------
 
-def generate_answer(question, results, history):
+def generate_answer(question, results, history, equipment=None):
 
     client = get_gemini_client()
 
@@ -127,6 +279,20 @@ def generate_answer(question, results, history):
 
     conversation = format_history(history)
 
+    equipment_context = "No equipment selected."
+
+    if equipment:
+        equipment_context = "\n".join([
+            f"Name: {equipment.get('name') or 'Not provided'}",
+            f"Type: {equipment.get('equipment_type') or 'Not provided'}",
+            f"Manufacturer: {equipment.get('manufacturer') or 'Not provided'}",
+            f"Model: {equipment.get('model_number') or 'Not provided'}",
+            f"Serial number: {equipment.get('serial_number') or 'Not provided'}",
+            f"Location: {equipment.get('location') or 'Not provided'}",
+            f"Status: {equipment.get('status') or 'Not provided'}",
+            f"Notes: {equipment.get('notes') or 'Not provided'}",
+        ])
+
     prompt = f"""
 You are RoboMaint AI, an industrial robotics and
 machine maintenance assistant.
@@ -136,6 +302,13 @@ components, maintenance and troubleshooting.
 
 CONVERSATION HISTORY:
 {conversation}
+
+SELECTED EQUIPMENT INFORMATION:
+{equipment_context}
+
+Use the equipment information to understand which machine
+the user is discussing. Do not treat equipment metadata as
+manufacturer-verified technical specifications.
 
 RELEVANT MANUAL EVIDENCE:
 {evidence}
@@ -191,7 +364,7 @@ previous conversation.
 # CHAT FUNCTION
 # -------------------------------
 
-def respond(message, history, knowledge_base):
+def respond(message, history, knowledge_base, equipment):
 
     history = history or []
 
@@ -223,7 +396,8 @@ def respond(message, history, knowledge_base):
                 answer = generate_answer(
                     message,
                     results,
-                    history
+                    history,
+                    equipment
                 )
 
         except Exception as error:
@@ -242,7 +416,7 @@ def respond(message, history, knowledge_base):
 # PDF MAINTENANCE REPORT
 # -------------------------------
 
-def generate_report(history):
+def generate_report(history, equipment=None):
 
     if not history:
         return None, "Start a conversation before generating a report."
@@ -262,6 +436,9 @@ from the following RoboMaint AI conversation.
 
 CONVERSATION:
 {conversation}
+
+SELECTED EQUIPMENT:
+{format_equipment_details(equipment)}
 
 Create a professional technical report with these sections:
 
@@ -460,6 +637,117 @@ with gr.Blocks(theme=gr.themes.Soft()) as demo:
     technical questions and maintenance reporting.
     """)
 
+
+    # -------------------------------
+    # EQUIPMENT MANAGEMENT UI
+    # -------------------------------
+
+    selected_equipment_state = gr.State(None)
+
+    with gr.Accordion("Equipment Management", open=True):
+
+        gr.Markdown("### Register Industrial Equipment")
+
+        with gr.Row():
+
+            equipment_name = gr.Textbox(
+                label="Equipment Name",
+                placeholder="e.g. Industrial Robotic Arm"
+            )
+
+            equipment_type = gr.Textbox(
+                label="Equipment Type",
+                placeholder="e.g. Robotic Manipulator"
+            )
+
+        with gr.Row():
+
+            equipment_manufacturer = gr.Textbox(
+                label="Manufacturer",
+                placeholder="e.g. ABB"
+            )
+
+            equipment_model = gr.Textbox(
+                label="Model Number",
+                placeholder="e.g. IRB 1200"
+            )
+
+        with gr.Row():
+
+            equipment_serial = gr.Textbox(
+                label="Serial Number"
+            )
+
+            equipment_location = gr.Textbox(
+                label="Installation Location"
+            )
+
+        equipment_notes = gr.Textbox(
+            label="Additional Notes",
+            lines=2
+        )
+
+        register_button = gr.Button(
+            "Register Equipment",
+            variant="primary"
+        )
+
+        equipment_status = gr.Markdown()
+
+        gr.Markdown("---")
+
+        gr.Markdown("### My Equipment")
+
+        equipment_dropdown = gr.Dropdown(
+            label="Select Equipment for Troubleshooting",
+            choices=[],
+            interactive=True
+        )
+
+        with gr.Row():
+
+            refresh_button = gr.Button("Refresh Equipment")
+
+        equipment_details = gr.Markdown(
+            "No equipment selected."
+        )
+
+        register_button.click(
+            register_equipment,
+            inputs=[
+                equipment_name,
+                equipment_type,
+                equipment_manufacturer,
+                equipment_model,
+                equipment_serial,
+                equipment_location,
+                equipment_notes,
+            ],
+            outputs=[
+                equipment_dropdown,
+                equipment_status,
+                selected_equipment_state,
+                equipment_details,
+            ]
+        )
+
+        refresh_button.click(
+            refresh_equipment,
+            outputs=[
+                equipment_dropdown,
+                equipment_status,
+            ]
+        )
+
+        equipment_dropdown.change(
+            select_equipment,
+            inputs=equipment_dropdown,
+            outputs=[
+                selected_equipment_state,
+                equipment_details,
+            ]
+        )
+    
     knowledge_state = gr.State(None)
 
     with gr.Row():
@@ -515,13 +803,23 @@ with gr.Blocks(theme=gr.themes.Soft()) as demo:
 
     message.submit(
         respond,
-        inputs=[message, chatbot, knowledge_state],
+        inputs=[
+            message,
+            chatbot,
+            knowledge_state,
+            selected_equipment_state,
+        ],
         outputs=[message, chatbot]
     )
 
     send_button.click(
         respond,
-        inputs=[message, chatbot, knowledge_state],
+        inputs=[
+            message,
+            chatbot,
+            knowledge_state,
+            selected_equipment_state,
+        ],
         outputs=[message, chatbot]
     )
 
@@ -552,7 +850,7 @@ with gr.Blocks(theme=gr.themes.Soft()) as demo:
 
     report_button.click(
         generate_report,
-        inputs=[chatbot],
+        inputs=[chatbot, selected_equipment_state],
         outputs=[report_file, report_status]
     )
 
